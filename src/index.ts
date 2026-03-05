@@ -8,6 +8,11 @@ import {
 } from './browser-service.js';
 
 import {
+  startOmniFocusService,
+  stopOmniFocusService,
+} from './omnifocus-service.js';
+
+import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
@@ -486,6 +491,7 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
   ensureBrowserNetwork();
   startBrowserSidecar();
+  startOmniFocusService();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -496,6 +502,7 @@ async function main(): Promise<void> {
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     stopBrowserSidecar();
+    stopOmniFocusService();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
