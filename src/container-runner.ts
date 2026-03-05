@@ -6,6 +6,7 @@ import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
+import { BROWSER_CDP_URL, BROWSER_NETWORK } from './browser-service.js';
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
@@ -250,6 +251,8 @@ function buildContainerArgs(
     }
   }
 
+  args.push('--network', BROWSER_NETWORK);
+  args.push('-e', `BROWSER_CDP_URL=${BROWSER_CDP_URL}`);
   args.push(CONTAINER_IMAGE);
 
   return args;

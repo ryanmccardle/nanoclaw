@@ -3,6 +3,7 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
+import { getTailscaleIp } from './browser-service.js';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
@@ -171,6 +172,7 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    reason?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -382,6 +384,33 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'browser_interactive': {
+      if (!data.chatJid) {
+        logger.warn({ sourceGroup }, 'browser_interactive missing chatJid');
+        break;
+      }
+      const targetGroup = registeredGroups[data.chatJid];
+      if (!isMain && (!targetGroup || targetGroup.folder !== sourceGroup)) {
+        logger.warn(
+          { sourceGroup, chatJid: data.chatJid },
+          'Unauthorized browser_interactive attempt blocked',
+        );
+        break;
+      }
+      const tailscaleIp = getTailscaleIp();
+      const msg =
+        `${data.reason || 'Ready for your input'}\n\n` +
+        `Connect at: chrome://inspect\n` +
+        `Host: ${tailscaleIp}:9222\n\n` +
+        `Reply "continue" when done.`;
+      await deps.sendMessage(data.chatJid, msg);
+      logger.info(
+        { sourceGroup, chatJid: data.chatJid },
+        'browser_interactive notification sent',
+      );
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

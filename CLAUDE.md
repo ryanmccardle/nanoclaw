@@ -20,6 +20,7 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 | `src/db.ts` | SQLite operations |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
 | `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
+| `src/browser-service.ts` | Browser sidecar lifecycle, Tailscale IP detection |
 
 ## Skills
 
@@ -54,6 +55,34 @@ systemctl --user start nanoclaw
 systemctl --user stop nanoclaw
 systemctl --user restart nanoclaw
 ```
+
+## Browser Sidecar
+
+A persistent `nanoclaw-browser` container runs Chromium alongside the agent containers. Agents connect to it via `ws://nanoclaw-browser:9222` (passed as `BROWSER_CDP_URL` env var). The sidecar preserves cookies and login state across agent turns.
+
+**Architecture:**
+- Docker network `nanoclaw-net` connects the sidecar and all agent containers
+- Chromium binds CDP internally on port 9221; a Python TCP proxy exposes it on `0.0.0.0:9222`
+- Port 9222 is forwarded through Colima to Mac host on all interfaces (including Tailscale)
+- Viewport: 1280×800
+
+**User takeover flow (login/CAPTCHA):**
+1. Andy navigates to the page and writes an IPC task (`browser_interactive` type)
+2. NanoClaw sends a Telegram message with `chrome://inspect` + Tailscale IP instructions
+3. User opens `chrome://inspect`, adds `<tailscale-ip>:9222`, clicks Inspect
+4. User completes the action, replies "continue"
+5. Andy resumes with session/cookies intact
+
+**Inspect from Mac:**
+```
+chrome://inspect → Configure → add 100.106.88.38:9222
+```
+
+**Troubleshooting:**
+- Check sidecar: `docker ps | grep nanoclaw-browser`
+- Test CDP: `curl http://localhost:9222/json/version`
+- View logs: `docker logs nanoclaw-browser`
+- Chromium ignores `--remote-debugging-address=0.0.0.0` — the Python proxy inside the container is what makes external access work
 
 ## Troubleshooting
 

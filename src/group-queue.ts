@@ -33,6 +33,7 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  private recoveredPrompts = new Map<string, string>();
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -55,6 +56,23 @@ export class GroupQueue {
 
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  /**
+   * Store a recovered prompt for a group (called by IPC orphan scanner at startup).
+   */
+  setRecoveredPrompt(groupJid: string, prompt: string): void {
+    this.recoveredPrompts.set(groupJid, prompt);
+  }
+
+  /**
+   * Return and consume the recovered prompt for a group, or null if none.
+   */
+  takeRecoveredPrompt(groupJid: string): string | null {
+    const prompt = this.recoveredPrompts.get(groupJid);
+    if (!prompt) return null;
+    this.recoveredPrompts.delete(groupJid);
+    return prompt;
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -216,6 +234,46 @@ export class GroupQueue {
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
+      // Scan for orphaned IPC input files that were written to a dying container
+      if (state.groupFolder) {
+        const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+        try {
+          if (fs.existsSync(inputDir)) {
+            const orphaned = fs
+              .readdirSync(inputDir)
+              .filter((f) => f.endsWith('.json'));
+            if (orphaned.length > 0) {
+              const lastFile = orphaned.sort().pop()!;
+              try {
+                const raw = fs.readFileSync(
+                  path.join(inputDir, lastFile),
+                  'utf-8',
+                );
+                const parsed = JSON.parse(raw);
+                if (parsed.text) {
+                  this.recoveredPrompts.set(groupJid, parsed.text);
+                }
+              } catch {
+                /* best effort */
+              }
+              for (const f of orphaned) {
+                try {
+                  fs.unlinkSync(path.join(inputDir, f));
+                } catch {
+                  /* ignore */
+                }
+              }
+              logger.info(
+                { groupJid, orphanedFiles: orphaned.length },
+                'Found orphaned IPC input files, re-queuing messages',
+              );
+              state.pendingMessages = true;
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }
       state.active = false;
       state.process = null;
       state.containerName = null;

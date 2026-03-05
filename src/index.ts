@@ -2,6 +2,12 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  ensureBrowserNetwork,
+  startBrowserSidecar,
+  stopBrowserSidecar,
+} from './browser-service.js';
+
+import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
@@ -151,7 +157,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     ASSISTANT_NAME,
   );
 
-  if (missedMessages.length === 0) return true;
+  if (missedMessages.length === 0) {
+    // Check for a prompt recovered from orphaned IPC files — messages that
+    // were piped to a dying container and never read.
+    const recovered = queue.takeRecoveredPrompt(chatJid);
+    if (!recovered) return true;
+
+    logger.info(
+      { group: group.name },
+      'Using recovered prompt from orphaned IPC',
+    );
+    const prompt = recovered;
+
+    await channel.setTyping?.(chatJid, true);
+    const output = await runAgent(group, prompt, chatJid, async (result) => {
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name },
+          `Agent output: ${raw.slice(0, 200)}`,
+        );
+        if (text) await channel.sendMessage(chatJid, text);
+      }
+    });
+
+    return output !== 'error';
+  }
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
@@ -449,6 +484,8 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+  ensureBrowserNetwork();
+  startBrowserSidecar();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -458,6 +495,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
+    stopBrowserSidecar();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
