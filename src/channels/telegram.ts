@@ -23,27 +23,26 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private lastPollComplete = Date.now();
+  private restarting = false;
+  private pollWatchdog: NodeJS.Timeout | null = null;
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
   }
 
-  async connect(): Promise<void> {
-    this.bot = new Bot(this.botToken);
+  private setupBot(): Bot {
+    const bot = new Bot(this.botToken);
 
-    // Diagnostic: track getUpdates timing without injecting foreign
-    // AbortSignals (Node 22 + undici rejects non-native signals, which
-    // can crash or stall the polling loop).
-    let lastPollComplete = Date.now();
-    this.bot.api.config.use(async (prev, method, payload, signal) => {
-      // Pass grammy's own signal through unchanged — do NOT create a
-      // new AbortController, as Node 22's fetch rejects foreign signals.
+    // Track getUpdates timing. Do NOT inject a foreign AbortController —
+    // Node 22 + undici ignores polyfilled AbortSignals, causing crashes.
+    bot.api.config.use(async (prev, method, payload, signal) => {
       const start = Date.now();
       try {
         const result = await prev(method, payload, signal);
         if (method === 'getUpdates') {
-          lastPollComplete = Date.now();
+          this.lastPollComplete = Date.now();
           const elapsed = Date.now() - start;
           if (elapsed > 45_000) {
             logger.warn({ elapsed }, 'Telegram getUpdates slow response');
@@ -52,7 +51,8 @@ export class TelegramChannel implements Channel {
         return result;
       } catch (err: any) {
         if (method === 'getUpdates') {
-          lastPollComplete = Date.now(); // still counts as "alive"
+          // Do NOT update lastPollComplete on error — the watchdog must be
+          // able to detect when polling has stopped due to 409 or network failure.
           const elapsed = Date.now() - start;
           logger.warn(
             { elapsed, error: err?.message || String(err) },
@@ -63,41 +63,8 @@ export class TelegramChannel implements Channel {
       }
     });
 
-    // Watchdog: if no getUpdates response in 2 minutes, restart the bot.
-    // This catches stale TCP connections that Node 22's fetch can't abort.
-    const pollWatchdog = setInterval(async () => {
-      const staleness = Date.now() - lastPollComplete;
-      if (staleness > 120_000 && this.bot) {
-        logger.warn(
-          { stalenessMs: staleness },
-          'Telegram polling stalled — restarting bot',
-        );
-        try {
-          this.bot.stop();
-        } catch {
-          /* ignore */
-        }
-        lastPollComplete = Date.now();
-        try {
-          this.bot.start({
-            onStart: () =>
-              logger.info('Telegram bot restarted after polling stall'),
-          });
-        } catch (err) {
-          logger.error({ err }, 'Failed to restart Telegram bot');
-        }
-      }
-    }, 60_000);
-
-    // Clean up watchdog on disconnect
-    const origDisconnect = this.disconnect.bind(this);
-    this.disconnect = async () => {
-      clearInterval(pollWatchdog);
-      return origDisconnect();
-    };
-
     // Command to get chat ID (useful for registration)
-    this.bot.command('chatid', (ctx) => {
+    bot.command('chatid', (ctx) => {
       const chatId = ctx.chat.id;
       const chatType = ctx.chat.type;
       const chatName =
@@ -112,11 +79,11 @@ export class TelegramChannel implements Channel {
     });
 
     // Command to check bot status
-    this.bot.command('ping', (ctx) => {
+    bot.command('ping', (ctx) => {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
     });
 
-    this.bot.on('message:text', async (ctx) => {
+    bot.on('message:text', async (ctx) => {
       // Skip commands
       if (ctx.message.text.startsWith('/')) return;
 
@@ -229,27 +196,71 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
-    this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
+    bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
+    bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
+    bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
+    bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
       storeNonText(ctx, `[Document: ${name}]`);
     });
-    this.bot.on('message:sticker', (ctx) => {
+    bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
       storeNonText(ctx, `[Sticker ${emoji}]`);
     });
-    this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
-    this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
+    bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
+    bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
 
-    // Handle errors gracefully
-    this.bot.catch((err) => {
+    bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
-    // Start polling — returns a Promise that resolves when started
+    return bot;
+  }
+
+  async connect(): Promise<void> {
+    this.bot = this.setupBot();
+
+    // Watchdog: restart if no successful getUpdates in 2 minutes.
+    // Creates a fresh Bot instance each time — reusing a stopped grammy
+    // Bot is unreliable. Waits 35s before restart so Telegram's previous
+    // 30s long-poll session has expired, avoiding 409 Conflict.
+    this.pollWatchdog = setInterval(async () => {
+      if (this.restarting) return;
+      const staleness = Date.now() - this.lastPollComplete;
+      if (staleness > 120_000) {
+        this.restarting = true;
+        logger.warn(
+          { stalenessMs: staleness },
+          'Telegram polling stalled — restarting bot',
+        );
+        try {
+          this.bot?.stop();
+        } catch {
+          /* ignore */
+        }
+        this.bot = null;
+
+        // Wait for Telegram's server to expire the previous long-poll
+        // (poll timeout is 30s, so 35s guarantees it's gone).
+        await new Promise<void>((resolve) => setTimeout(resolve, 35_000));
+
+        this.lastPollComplete = Date.now();
+        this.bot = this.setupBot();
+        this.bot
+          .start({
+            onStart: () => {
+              logger.info('Telegram bot restarted after polling stall');
+              this.restarting = false;
+            },
+          })
+          .catch((err) => {
+            logger.error({ err }, 'Telegram bot restart failed');
+            this.restarting = false;
+          });
+      }
+    }, 60_000);
+
     return new Promise<void>((resolve) => {
       this.bot!.start({
         onStart: (botInfo) => {
@@ -303,6 +314,10 @@ export class TelegramChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    if (this.pollWatchdog) {
+      clearInterval(this.pollWatchdog);
+      this.pollWatchdog = null;
+    }
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
